@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 python-multipart
-httpx==0.25.2
-supabase==2.3.4
+httpx
+supabase==2.7.4
 rayvision_api==3.0.4.1
 rayvision_sync==3.1.7
 python-dotenv
