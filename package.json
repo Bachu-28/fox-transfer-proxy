@@ -1,0 +1,17 @@
+{
+  "name": "fox-transfer-proxy",
+  "version": "1.0.0",
+  "description": "FTP proxy for FoxRenderFarm",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "ftp": "^0.3.10",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
