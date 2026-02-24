@@ -227,7 +227,13 @@ async def run_transfer_job(req: TransferJobRequest):
         # STEP 1: Download ZIP from Supabase Storage
         logger.info(f"Downloading ZIP from Supabase: {req.storage_path}")
         try:
-            signed = req.signed_url if req.signed_url else get_signed_url(BUCKET_INPUT, req.storage_path, expires=3600)
+            # Use public URL directly (bucket must be public)
+            if req.signed_url:
+                signed = req.signed_url
+                logger.info("Using pre-signed URL from edge function")
+            else:
+                signed = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_INPUT}/{req.storage_path}"
+                logger.info(f"Using public URL: {signed}")
             async with httpx.AsyncClient(timeout=600) as client:
                 async with client.stream("GET", signed) as resp:
                     resp.raise_for_status()
