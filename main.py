@@ -10,6 +10,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote  # Added for URL encoding
 
 import httpx
 import uvicorn
@@ -51,7 +52,7 @@ class TransferJobRequest(BaseModel):
     software: str
     frame_start: int
     frame_end: int
-    signed_url: Optional[str] = None  # Received but ignored in favor of Public URL
+    signed_url: Optional[str] = None
 
 class DownloadJobRequest(BaseModel):
     job_id: str
@@ -102,10 +103,6 @@ def update_job_status(job_id: str, status: str, error: str = None):
         payload["error_message"] = error
     update_job(job_id, payload)
     logger.info(f"Job {job_id} → {status}" + (f" ({error})" if error else ""))
-
-def get_signed_url(bucket: str, path: str, expires: int = 3600) -> str:
-    result = supabase.storage.from_(bucket).create_signed_url(path, expires)
-    return result["signedURL"]
 
 # ── BUILD CONFIG JSON FILES ────────────────────────────────────
 def build_upload_json(extracted_dir: str, fox_task_id: str) -> dict:
@@ -224,11 +221,12 @@ async def run_transfer_job(req: TransferJobRequest):
         extract_dir.mkdir()
         config_dir.mkdir()
 
-        # STEP 1: Download ZIP from Supabase Storage using PUBLIC URL
+        # STEP 1: Download ZIP from Supabase Storage using URL-Encoded PUBLIC URL
         logger.info(f"Downloading ZIP from Supabase: {req.storage_path}")
         try:
-            # Force use of public URL directly
-            public_download_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_INPUT}/{req.storage_path}"
+            # We encode the path but preserve the '/' character so Supabase knows it's a folder structure
+            safe_path = quote(req.storage_path, safe="/")
+            public_download_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_INPUT}/{safe_path}"
             logger.info(f"Using public URL: {public_download_url}")
             
             async with httpx.AsyncClient(timeout=600) as client:
@@ -355,8 +353,7 @@ async def run_transfer_job(req: TransferJobRequest):
 
     logger.info(f"Transfer pipeline complete for job {req.job_id}")
 
-
-# ── POLLING ────────────────────────────────────────────────────
+# ── POLLING & CALLBACKS ────────────────────────────────────────
 FOX_STATUS_MAP = {
     "0":  "rendering",
     "10": "done",
@@ -371,131 +368,67 @@ FOX_STATUS_MAP = {
 async def poll_job_status(job_id: str, fox_task_id: str):
     logger.info(f"Polling job {job_id} (Fox {fox_task_id})")
     terminal_states = {"done", "error", "stopped", "aborted"}
-
     while True:
         await asyncio.sleep(30)
         try:
             result = await fox_api("GET", "/api/render/task/taskInfo", {"task_id": fox_task_id})
             if result.get("code") not in [200, "200"]:
-                logger.warning(f"Poll failed: {result.get('message')}")
                 continue
-
             task_data  = result.get("data", {})
             status_code = str(task_data.get("taskStatus", "35"))
             new_status  = FOX_STATUS_MAP.get(status_code, "queued")
-
+            
             frames_result = await fox_api("GET", "/api/render/task/queryTaskFrames", {"task_id": fox_task_id})
             frames_data   = frames_result.get("data", {})
-            frames_done   = frames_data.get("completedFrames", 0)
-            frames_failed = frames_data.get("failedFrames", 0)
-            frames_total  = frames_data.get("totalFrames", 0)
-
             update_job(job_id, {
                 "status":        new_status,
-                "frames_done":   frames_done,
-                "frames_failed": frames_failed,
-                "frames_total":  frames_total,
+                "frames_done":   frames_data.get("completedFrames", 0),
+                "frames_failed": frames_data.get("failedFrames", 0),
+                "frames_total":  frames_data.get("totalFrames", 0),
             })
-            logger.info(f"Job {job_id}: {new_status} | {frames_done}/{frames_total} frames")
-
             if new_status == "done":
                 asyncio.create_task(download_outputs(job_id, fox_task_id))
                 break
-
             if new_status in terminal_states:
                 break
-
             if new_status == "rendering":
                 asyncio.create_task(fetch_thumbnails(job_id, fox_task_id))
-
         except Exception as e:
-            logger.error(f"Poll error: {e}", exc_info=True)
+            logger.error(f"Poll error: {e}")
 
-
-# ── THUMBNAIL FETCH ────────────────────────────────────────────
 async def fetch_thumbnails(job_id: str, fox_task_id: str):
     try:
         result = await fox_api("GET", "/api/render/task/getFrameThumbnail", {"taskId": fox_task_id})
         thumbs = result.get("data", [])
-        if not thumbs:
-            return
-        rows = []
-        for thumb in thumbs:
-            rows.append({
-                "job_id":        job_id,
-                "frame_number":  thumb.get("frameNumber"),
-                "status":        "done",
-                "thumbnail_url": thumb.get("thumbnailUrl"),
-            })
+        rows = [{"job_id": job_id, "frame_number": t.get("frameNumber"), "status": "done", "thumbnail_url": t.get("thumbnailUrl")} for t in thumbs]
         if rows:
             supabase.table("job_frames").upsert(rows, on_conflict="job_id,frame_number").execute()
-            logger.info(f"Stored {len(rows)} thumbnails for job {job_id}")
-    except Exception as e:
-        logger.warning(f"Thumbnail fetch failed: {e}")
+    except Exception:
+        pass
 
-
-# ── OUTPUT DOWNLOAD ────────────────────────────────────────────
 async def download_outputs(job_id: str, fox_task_id: str):
     logger.info(f"Downloading outputs for job {job_id}")
-
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "output"
         output_dir.mkdir()
-
         try:
             from rayvision_api import RayvisionAPI
             from rayvision_sync.download import RayvisionDownload
-
-            api = RayvisionAPI(
-                access_id=FOX_ACCESS_ID,
-                access_key=FOX_ACCESS_KEY,
-                domain=FOX_DOMAIN,
-                platform=FOX_PLATFORM,
-            )
+            api = RayvisionAPI(access_id=FOX_ACCESS_ID, access_key=FOX_ACCESS_KEY, domain=FOX_DOMAIN, platform=FOX_PLATFORM)
             download = RayvisionDownload(api)
-
-            logger.info(f"Downloading frames to {output_dir}...")
-            download.auto_download_after_task_completed(
-                task_id_list=[int(fox_task_id)],
-                local_path=str(output_dir),
-                download_filename_format="false",
-                engine_type="aspera",
-                server_ip=FOX_TRANSFER_IP,
-                server_port=FOX_TRANSFER_PORT,
-                sleep_time=10,
-            )
-            logger.info("Frames downloaded from Fox ✓")
-
+            download.auto_download_after_task_completed(task_id_list=[int(fox_task_id)], local_path=str(output_dir), engine_type="aspera", server_ip=FOX_TRANSFER_IP, server_port=FOX_TRANSFER_PORT)
         except Exception as e:
-            logger.error(f"Fox download failed: {e}", exc_info=True)
             update_job_status(job_id, "error", f"Output download failed: {str(e)}")
             return
-
-        # Upload frames to Supabase Storage
         uploaded_urls = []
         for frame_file in sorted(output_dir.rglob("*")):
-            if not frame_file.is_file():
-                continue
+            if not frame_file.is_file(): continue
             storage_key = f"{job_id}/{frame_file.name}"
-            try:
-                with open(frame_file, "rb") as f:
-                    supabase.storage.from_(BUCKET_OUTPUT).upload(
-                        storage_key, f,
-                        {"content-type": "application/octet-stream", "x-upsert": "true"}
-                    )
-                url = supabase.storage.from_(BUCKET_OUTPUT).get_public_url(storage_key)
-                uploaded_urls.append({"filename": frame_file.name, "url": url, "storage_key": storage_key})
-                logger.info(f"Uploaded: {frame_file.name}")
-            except Exception as e:
-                logger.warning(f"Failed to upload {frame_file.name}: {e}")
-
-        update_job(job_id, {
-            "status":       "done",
-            "output_files": uploaded_urls,
-            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
-        logger.info(f"Job {job_id} complete. {len(uploaded_urls)} frames uploaded ✓")
-
+            with open(frame_file, "rb") as f:
+                supabase.storage.from_(BUCKET_OUTPUT).upload(storage_key, f, {"x-upsert": "true"})
+            url = supabase.storage.from_(BUCKET_OUTPUT).get_public_url(storage_key)
+            uploaded_urls.append({"filename": frame_file.name, "url": url})
+        update_job(job_id, {"status": "done", "output_files": uploaded_urls, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 
 # ── API ENDPOINTS ──────────────────────────────────────────────
 def verify_secret(x_worker_secret: Optional[str] = Header(None)):
@@ -504,107 +437,30 @@ def verify_secret(x_worker_secret: Optional[str] = Header(None)):
 
 @app.get("/")
 async def health():
-    return {
-        "status": "online",
-        "service": "RenderRay Worker",
-        "fox_domain": FOX_DOMAIN,
-        "platform": FOX_PLATFORM,
-    }
+    return {"status": "online", "service": "RenderRay Worker"}
 
 @app.post("/transfer")
-async def start_transfer(
-    req: TransferJobRequest,
-    background_tasks: BackgroundTasks,
-    x_worker_secret: Optional[str] = Header(None)
-):
+async def start_transfer(req: TransferJobRequest, background_tasks: BackgroundTasks, x_worker_secret: Optional[str] = Header(None)):
     verify_secret(x_worker_secret)
     background_tasks.add_task(run_transfer_job, req)
     return {"accepted": True, "job_id": req.job_id, "fox_task_id": req.fox_task_id}
 
-@app.post("/download")
-async def trigger_download(
-    req: DownloadJobRequest,
-    background_tasks: BackgroundTasks,
-    x_worker_secret: Optional[str] = Header(None)
-):
-    verify_secret(x_worker_secret)
-    background_tasks.add_task(download_outputs, req.job_id, req.fox_task_id)
-    return {"accepted": True, "job_id": req.job_id}
-
-@app.get("/status/{job_id}")
-async def check_status(job_id: str, x_worker_secret: Optional[str] = Header(None)):
-    verify_secret(x_worker_secret)
-    result = supabase.table("cloud_render_jobs").select("*").eq("id", job_id).single().execute()
-    return result.data
-
-
-# ── FOX CALLBACK ENDPOINT ──────────────────────────────────────
-# Fox calls this URL when task/frame status changes
-class FoxCallbackPayload(BaseModel):
-    task_id: Optional[str] = None
-    taskId: Optional[str] = None
-    status: Optional[int] = None
-    taskStatus: Optional[int] = None
-    done_frames: Optional[int] = None
-    doneFrames: Optional[int] = None
-    failed_frames: Optional[int] = None
-    failedFrames: Optional[int] = None
-    total_frames: Optional[int] = None
-    totalFrames: Optional[int] = None
-
 @app.post("/fox-callback")
 async def fox_callback(payload: dict, background_tasks: BackgroundTasks):
-    logger.info(f"Fox callback received: {payload}")
-
-    # Extract task_id (Fox uses different field names)
     fox_task_id = str(payload.get("task_id") or payload.get("taskId") or "")
-    if not fox_task_id:
-        logger.warning("Fox callback missing task_id")
-        return {"ok": True}
-
-    # Extract status
-    status_code = str(payload.get("taskStatus") or payload.get("status") or "35")
-    new_status = FOX_STATUS_MAP.get(status_code, "queued")
-
-    # Extract frame counts
-    frames_done   = payload.get("doneFrames") or payload.get("done_frames") or 0
-    frames_failed = payload.get("failedFrames") or payload.get("failed_frames") or 0
-    frames_total  = payload.get("totalFrames") or payload.get("total_frames") or 0
-
-    logger.info(f"Fox task {fox_task_id}: status={new_status} frames={frames_done}/{frames_total}")
-
-    # Find the job in DB by fox_task_id
+    if not fox_task_id: return {"ok": True}
     try:
         result = supabase.table("cloud_render_jobs").select("id").eq("fox_task_id", fox_task_id).execute()
-        if not result.data:
-            logger.warning(f"No job found for Fox task {fox_task_id}")
-            return {"ok": True}
-
-        job_id = result.data[0]["id"]
-
-        # Update job status
-        update_job(job_id, {
-            "status":        new_status,
-            "frames_done":   frames_done,
-            "frames_failed": frames_failed,
-            "frames_total":  frames_total,
-        })
-        logger.info(f"Updated job {job_id} → {new_status}")
-
-        # If done — trigger download
-        if new_status == "done":
-            logger.info(f"Job {job_id} complete via callback! Starting download...")
-            background_tasks.add_task(download_outputs, job_id, fox_task_id)
-
-        # Fetch thumbnails while rendering
-        if new_status == "rendering":
-            background_tasks.add_task(fetch_thumbnails, job_id, fox_task_id)
-
-    except Exception as e:
-        logger.error(f"Callback processing error: {e}", exc_info=True)
-
+        if result.data:
+            job_id = result.data[0]["id"]
+            status_code = str(payload.get("taskStatus") or payload.get("status") or "35")
+            new_status = FOX_STATUS_MAP.get(status_code, "queued")
+            update_job(job_id, {"status": new_status, "frames_done": payload.get("doneFrames", 0)})
+            if new_status == "done":
+                background_tasks.add_task(download_outputs, job_id, fox_task_id)
+    except Exception:
+        pass
     return {"ok": True}
-
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), reload=False)
