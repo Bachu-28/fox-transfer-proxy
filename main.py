@@ -51,7 +51,7 @@ class TransferJobRequest(BaseModel):
     software: str
     frame_start: int
     frame_end: int
-    signed_url: Optional[str] = None  # If provided, skip generating signed URL
+    signed_url: Optional[str] = None  # Received but ignored in favor of Public URL
 
 class DownloadJobRequest(BaseModel):
     job_id: str
@@ -224,18 +224,15 @@ async def run_transfer_job(req: TransferJobRequest):
         extract_dir.mkdir()
         config_dir.mkdir()
 
-        # STEP 1: Download ZIP from Supabase Storage
+        # STEP 1: Download ZIP from Supabase Storage using PUBLIC URL
         logger.info(f"Downloading ZIP from Supabase: {req.storage_path}")
         try:
-            # Use public URL directly (bucket must be public)
-            if req.signed_url:
-                signed = req.signed_url
-                logger.info("Using pre-signed URL from edge function")
-            else:
-                signed = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_INPUT}/{req.storage_path}"
-                logger.info(f"Using public URL: {signed}")
+            # Force use of public URL directly
+            public_download_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_INPUT}/{req.storage_path}"
+            logger.info(f"Using public URL: {public_download_url}")
+            
             async with httpx.AsyncClient(timeout=600) as client:
-                async with client.stream("GET", signed) as resp:
+                async with client.stream("GET", public_download_url) as resp:
                     resp.raise_for_status()
                     with open(zip_path, "wb") as f:
                         async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
@@ -543,9 +540,6 @@ async def check_status(job_id: str, x_worker_secret: Optional[str] = Header(None
 
 # ── FOX CALLBACK ENDPOINT ──────────────────────────────────────
 # Fox calls this URL when task/frame status changes
-# Set this URL in Fox Developer Center → Callback URL:
-# https://fox-transfer-proxy-production.up.railway.app/fox-callback
-
 class FoxCallbackPayload(BaseModel):
     task_id: Optional[str] = None
     taskId: Optional[str] = None
@@ -560,10 +554,6 @@ class FoxCallbackPayload(BaseModel):
 
 @app.post("/fox-callback")
 async def fox_callback(payload: dict, background_tasks: BackgroundTasks):
-    """
-    Fox calls this endpoint when a task status changes.
-    No auth needed — Fox doesn't support adding auth headers to callbacks.
-    """
     logger.info(f"Fox callback received: {payload}")
 
     # Extract task_id (Fox uses different field names)
