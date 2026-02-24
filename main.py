@@ -535,5 +535,80 @@ async def check_status(job_id: str, x_worker_secret: Optional[str] = Header(None
     return result.data
 
 
+# ── FOX CALLBACK ENDPOINT ──────────────────────────────────────
+# Fox calls this URL when task/frame status changes
+# Set this URL in Fox Developer Center → Callback URL:
+# https://fox-transfer-proxy-production.up.railway.app/fox-callback
+
+class FoxCallbackPayload(BaseModel):
+    task_id: Optional[str] = None
+    taskId: Optional[str] = None
+    status: Optional[int] = None
+    taskStatus: Optional[int] = None
+    done_frames: Optional[int] = None
+    doneFrames: Optional[int] = None
+    failed_frames: Optional[int] = None
+    failedFrames: Optional[int] = None
+    total_frames: Optional[int] = None
+    totalFrames: Optional[int] = None
+
+@app.post("/fox-callback")
+async def fox_callback(payload: dict, background_tasks: BackgroundTasks):
+    """
+    Fox calls this endpoint when a task status changes.
+    No auth needed — Fox doesn't support adding auth headers to callbacks.
+    """
+    logger.info(f"Fox callback received: {payload}")
+
+    # Extract task_id (Fox uses different field names)
+    fox_task_id = str(payload.get("task_id") or payload.get("taskId") or "")
+    if not fox_task_id:
+        logger.warning("Fox callback missing task_id")
+        return {"ok": True}
+
+    # Extract status
+    status_code = str(payload.get("taskStatus") or payload.get("status") or "35")
+    new_status = FOX_STATUS_MAP.get(status_code, "queued")
+
+    # Extract frame counts
+    frames_done   = payload.get("doneFrames") or payload.get("done_frames") or 0
+    frames_failed = payload.get("failedFrames") or payload.get("failed_frames") or 0
+    frames_total  = payload.get("totalFrames") or payload.get("total_frames") or 0
+
+    logger.info(f"Fox task {fox_task_id}: status={new_status} frames={frames_done}/{frames_total}")
+
+    # Find the job in DB by fox_task_id
+    try:
+        result = supabase.table("cloud_render_jobs").select("id").eq("fox_task_id", fox_task_id).execute()
+        if not result.data:
+            logger.warning(f"No job found for Fox task {fox_task_id}")
+            return {"ok": True}
+
+        job_id = result.data[0]["id"]
+
+        # Update job status
+        update_job(job_id, {
+            "status":        new_status,
+            "frames_done":   frames_done,
+            "frames_failed": frames_failed,
+            "frames_total":  frames_total,
+        })
+        logger.info(f"Updated job {job_id} → {new_status}")
+
+        # If done — trigger download
+        if new_status == "done":
+            logger.info(f"Job {job_id} complete via callback! Starting download...")
+            background_tasks.add_task(download_outputs, job_id, fox_task_id)
+
+        # Fetch thumbnails while rendering
+        if new_status == "rendering":
+            background_tasks.add_task(fetch_thumbnails, job_id, fox_task_id)
+
+    except Exception as e:
+        logger.error(f"Callback processing error: {e}", exc_info=True)
+
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), reload=False)
